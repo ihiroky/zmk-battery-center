@@ -54,6 +54,13 @@ struct MonitorConnectionState {
 struct MonitorTask {
     stop_tx: watch::Sender<bool>,
     join_handles: Vec<JoinHandle<()>>,
+    adapter: Adapter,
+    target_device: Device,
+}
+
+#[derive(Default)]
+struct MonitorDeviceConnectionControl {
+    connect_lock: Mutex<()>,
 }
 
 static MONITORS: LazyLock<Mutex<HashMap<String, MonitorTask>>> =
@@ -285,6 +292,7 @@ async fn battery_notification_worker(
     device_id: String,
     worker_id: usize,
     monitor_connection_state: Arc<Mutex<MonitorConnectionState>>,
+    connection_control: Arc<MonitorDeviceConnectionControl>,
     context: BatteryCharacteristicContext,
     mut stop_rx: watch::Receiver<bool>,
 ) {
@@ -293,11 +301,27 @@ async fn battery_notification_worker(
     loop {
         if *stop_rx.borrow() {
             log::debug!("BLE I/O: notification worker stopped by signal device_id={device_id}");
+            if is_worker_connected {
+                update_monitor_connection_state(
+                    &app,
+                    &device_id,
+                    worker_id,
+                    false,
+                    &monitor_connection_state,
+                )
+                .await;
+            }
             return;
         }
 
-        log::debug!("BLE I/O: connect request for notification monitor device_id={device_id}");
-        if let Err(e) = adapter.connect_device(&target_device).await {
+        if let Err(e) = ensure_device_connected(
+            &adapter,
+            &target_device,
+            &device_id,
+            &connection_control,
+        )
+        .await
+        {
             log::warn!("Failed to connect device {} for notification monitor: {}", device_id, e);
             if is_worker_connected {
                 is_worker_connected = false;
@@ -315,7 +339,6 @@ async fn battery_notification_worker(
             }
             continue;
         }
-        log::debug!("BLE I/O: connect response success device_id={device_id}");
 
         log::debug!(
             "BLE I/O: notify subscribe request device_id={} descriptor={}",
@@ -370,6 +393,16 @@ async fn battery_notification_worker(
                 changed = stop_rx.changed() => {
                     if changed.is_err() || *stop_rx.borrow() {
                         log::debug!("BLE I/O: notification worker stop event device_id={device_id}");
+                        if is_worker_connected {
+                            update_monitor_connection_state(
+                                &app,
+                                &device_id,
+                                worker_id,
+                                false,
+                                &monitor_connection_state,
+                            )
+                            .await;
+                        }
                         return;
                     }
                 }
@@ -442,6 +475,30 @@ async fn battery_notification_worker(
     }
 }
 
+async fn ensure_device_connected(
+    adapter: &Adapter,
+    target_device: &Device,
+    device_id: &str,
+    connection_control: &MonitorDeviceConnectionControl,
+) -> Result<(), String> {
+    if target_device.is_connected().await {
+        return Ok(());
+    }
+
+    let _connect_guard = connection_control.connect_lock.lock().await;
+    if target_device.is_connected().await {
+        return Ok(());
+    }
+
+    log::debug!("BLE I/O: connect request for notification monitor device_id={device_id}");
+    adapter
+        .connect_device(target_device)
+        .await
+        .map_err(|e| e.to_string())?;
+    log::debug!("BLE I/O: connect response success device_id={device_id}");
+    Ok(())
+}
+
 async fn stop_battery_notification_monitor_internal(id: &str) {
     let monitor = {
         let mut monitors = MONITORS.lock().await;
@@ -452,6 +509,24 @@ async fn stop_battery_notification_monitor_internal(id: &str) {
         let _ = monitor.stop_tx.send(true);
         for handle in monitor.join_handles {
             handle.abort();
+        }
+
+        if monitor.target_device.is_connected().await {
+            log::debug!("BLE I/O: disconnect request (notification) device_id={id}");
+            match monitor.adapter.disconnect_device(&monitor.target_device).await {
+                Ok(()) => {
+                    log::debug!(
+                        "BLE I/O: disconnect response success (notification) device_id={id}"
+                    );
+                }
+                Err(e) => {
+                    log::warn!(
+                        "BLE I/O: disconnect response failed (notification) device_id={} error={}",
+                        id,
+                        e
+                    );
+                }
+            }
         }
     }
 }
@@ -514,6 +589,7 @@ pub async fn start_battery_notification_monitor(
     log::debug!("BLE I/O: start notification monitor request device_id={}", id);
     let adapter = get_adapter().await?;
     let target_device = get_target_device(&adapter, &id).await?;
+    stop_battery_notification_monitor_internal(&id).await;
 
     log::debug!("BLE I/O: connect request (notification) device_id={id}");
     adapter
@@ -527,12 +603,11 @@ pub async fn start_battery_notification_monitor(
         return Err("Battery level characteristic not found".to_string());
     }
 
-    stop_battery_notification_monitor_internal(&id).await;
-
     let initial_battery_infos = read_battery_infos_best_effort(&contexts).await;
     let (stop_tx, stop_rx) = watch::channel(false);
     let mut join_handles = Vec::new();
     let monitor_connection_state = Arc::new(Mutex::new(MonitorConnectionState::default()));
+    let connection_control = Arc::new(MonitorDeviceConnectionControl::default());
 
     let mut notify_contexts = Vec::new();
     for context in contexts.iter().cloned() {
@@ -564,6 +639,7 @@ pub async fn start_battery_notification_monitor(
         let id_cloned = id.clone();
         let stop_rx_cloned = stop_rx.clone();
         let connection_state_cloned = monitor_connection_state.clone();
+        let connection_control_cloned = connection_control.clone();
 
         join_handles.push(tokio::spawn(async move {
             battery_notification_worker(
@@ -573,6 +649,7 @@ pub async fn start_battery_notification_monitor(
                 id_cloned,
                 worker_id,
                 connection_state_cloned,
+                connection_control_cloned,
                 context,
                 stop_rx_cloned,
             )
@@ -587,6 +664,8 @@ pub async fn start_battery_notification_monitor(
             MonitorTask {
                 stop_tx,
                 join_handles,
+                adapter,
+                target_device,
             },
         );
     }
