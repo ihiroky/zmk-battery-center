@@ -712,11 +712,18 @@ pub async fn list_battery_devices() -> Result<Vec<BleDeviceInfo>, String> {
     let mut result = Vec::new();
 
     for device in devices.into_iter() {
+        let id = format_device_id_for_store(&device);
         let name = match device.name() {
             Ok(n) => n.to_string(),
-            Err(_) => continue,
+            Err(e) => {
+                log::warn!(
+                    "BLE I/O: device name lookup failed device_id={}: {}",
+                    id,
+                    e
+                );
+                "(unknown)".to_string()
+            }
         };
-        let id = format_device_id_for_store(&device);
         result.push(BleDeviceInfo { name, id });
     }
     log::debug!("BLE I/O: list connected battery devices response count={}", result.len());
