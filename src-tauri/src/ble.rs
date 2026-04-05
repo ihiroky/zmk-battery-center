@@ -109,7 +109,7 @@ async fn disconnect_device(adapter: &Adapter, device: &Device) {
 async fn get_target_device(adapter: &Adapter, id: &str) -> Result<Device, String> {
     log::debug!("BLE I/O: searching target device id={id}");
     let devices = adapter
-        .connected_devices_with_services(&[BATTERY_SERVICE_UUID, BATTERY_LEVEL_UUID])
+        .connected_devices_with_services(&[BATTERY_SERVICE_UUID])
         .await
         .map_err(|e| e.to_string())?;
 
@@ -443,7 +443,7 @@ async fn battery_connection_watcher(
         // connected devices are yielded first; unconnected ones appear once BLE scanning begins.
         log::debug!("BLE I/O: connection watcher starting discover_devices device_id={device_id}");
         let mut discover = match adapter
-            .discover_devices(&[BATTERY_SERVICE_UUID, BATTERY_LEVEL_UUID])
+            .discover_devices(&[BATTERY_SERVICE_UUID])
             .await
         {
             Ok(s) => s,
@@ -512,7 +512,7 @@ async fn battery_connection_watcher(
 
         // Check whether the device is already connected (returned in the connected-first batch).
         let already_connected = adapter
-            .connected_devices_with_services(&[BATTERY_SERVICE_UUID, BATTERY_LEVEL_UUID])
+            .connected_devices_with_services(&[BATTERY_SERVICE_UUID])
             .await
             .map(|devs| devs.iter().any(|d| is_target_device(d, &device_id)))
             .unwrap_or(false);
@@ -705,18 +705,25 @@ pub async fn list_battery_devices() -> Result<Vec<BleDeviceInfo>, String> {
 
     log::debug!("BLE I/O: list connected battery devices request");
     let devices = adapter
-        .connected_devices_with_services(&[BATTERY_SERVICE_UUID, BATTERY_LEVEL_UUID])
+        .connected_devices_with_services(&[BATTERY_SERVICE_UUID])
         .await
         .map_err(|e| e.to_string())?;
 
     let mut result = Vec::new();
 
     for device in devices.into_iter() {
+        let id = format_device_id_for_store(&device);
         let name = match device.name() {
             Ok(n) => n.to_string(),
-            Err(_) => continue,
+            Err(e) => {
+                log::warn!(
+                    "BLE I/O: device name lookup failed device_id={}: {}",
+                    id,
+                    e
+                );
+                "(unknown)".to_string()
+            }
         };
-        let id = format_device_id_for_store(&device);
         result.push(BleDeviceInfo { name, id });
     }
     log::debug!("BLE I/O: list connected battery devices response count={}", result.len());
